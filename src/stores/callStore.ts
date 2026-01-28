@@ -1,5 +1,5 @@
 import { create } from 'zustand'
-import { VoiceClient } from '../lib/voice/VoiceClient'
+import { VoiceClient, ConnectionState } from '../lib/voice/VoiceClient'
 import { callsApi } from '../api/messages'
 import { useAuthStore } from './authStore'
 
@@ -29,7 +29,14 @@ type CallState = {
   voiceClient: VoiceClient | null
   isMuted: boolean
 
-  // Users in current call
+  // Joining state to prevent double-clicks
+  isJoining: boolean
+
+  // Reconnecting state (voice client is attempting to reconnect)
+  isReconnecting: boolean
+  reconnectAttempt: number
+
+  // Users in current call (excluding self)
   voiceUsers: VoiceUser[]
 
   // Noise suppression
@@ -55,18 +62,33 @@ export const useCallStore = create<CallState>((set, get) => ({
   calls: {},
   voiceClient: null,
   isMuted: false,
+  isJoining: false,
+  isReconnecting: false,
+  reconnectAttempt: 0,
   voiceUsers: [],
   noiseSuppression: true,
 
   startCall: async (conversationId: string) => {
-    const { myCall } = get()
+    const { myCall, isJoining } = get()
     const currentUser = useAuthStore.getState().user
 
+    // Prevent double-click
+    if (isJoining) {
+      console.warn('Already joining a call')
+      return
+    }
+
     // Already in a call?
-    if (myCall && myCall.conversationId !== conversationId) {
+    if (myCall) {
+      if (myCall.conversationId === conversationId) {
+        console.warn('Already in this call')
+        return
+      }
       console.error('Already in another call')
       return
     }
+
+    set({ isJoining: true })
 
     try {
       const response = await callsApi.startCall(conversationId)
@@ -88,10 +110,14 @@ export const useCallStore = create<CallState>((set, get) => ({
         userId: currentUser?.id || '',
         token: response.token,
         noiseSuppression: get().noiseSuppression,
+        maxReconnectAttempts: 5,
         onUserJoin: (user) => {
-          set((state) => ({
-            voiceUsers: [...state.voiceUsers, { id: user.userId, speaking: false }],
-          }))
+          // Don't add self or duplicates
+          if (user.userId === currentUser?.id) return
+          set((state) => {
+            if (state.voiceUsers.some((u) => u.id === user.userId)) return state
+            return { voiceUsers: [...state.voiceUsers, { id: user.userId, speaking: false }] }
+          })
         },
         onUserLeave: (userId) => {
           set((state) => ({
@@ -110,16 +136,36 @@ export const useCallStore = create<CallState>((set, get) => ({
         },
         onConnected: () => {
           console.log('Voice connected')
+          // Clear reconnecting state on successful connect/reconnect
+          set({ isReconnecting: false, reconnectAttempt: 0 })
+        },
+        onReconnecting: (attempt, maxAttempts) => {
+          console.log(`Voice reconnecting: attempt ${attempt}/${maxAttempts}`)
+          set({ isReconnecting: true, reconnectAttempt: attempt })
+        },
+        onStateChange: (state) => {
+          console.log('Voice state changed:', state)
+          if (state === ConnectionState.DISCONNECTED) {
+            set({ isReconnecting: false, reconnectAttempt: 0 })
+          }
         },
         onDisconnected: () => {
-          console.log('Voice disconnected')
-          // Clean up state directly (don't call leaveCall to avoid recursion)
+          // This is only called when VoiceClient gives up after all reconnect attempts
+          console.log('Voice disconnected (final)')
           const { myCall: currentCall } = get()
           if (currentCall) {
             // Notify backend
             callsApi.leaveCall(currentCall.id).catch(() => {})
             // Clear local state
-            set({ myCall: null, voiceClient: null, isMuted: false, voiceUsers: [] })
+            set({
+              myCall: null,
+              voiceClient: null,
+              isMuted: false,
+              isJoining: false,
+              isReconnecting: false,
+              reconnectAttempt: 0,
+              voiceUsers: [],
+            })
           }
         },
       })
@@ -127,21 +173,33 @@ export const useCallStore = create<CallState>((set, get) => ({
       await voiceClient.connect()
       await voiceClient.startSpeaking()
 
-      set({ voiceClient })
+      set({ voiceClient, isJoining: false })
     } catch (err) {
       console.error('Failed to start call:', err)
-      set({ myCall: null })
+      set({ myCall: null, isJoining: false })
     }
   },
 
   joinCall: async (callId: string, conversationId: string) => {
-    const { myCall } = get()
+    const { myCall, isJoining } = get()
     const currentUser = useAuthStore.getState().user
 
-    if (myCall) {
-      console.error('Already in a call')
+    // Prevent double-click
+    if (isJoining) {
+      console.warn('Already joining a call')
       return
     }
+
+    if (myCall) {
+      if (myCall.id === callId) {
+        console.warn('Already in this call')
+        return
+      }
+      console.error('Already in another call')
+      return
+    }
+
+    set({ isJoining: true })
 
     try {
       const response = await callsApi.joinCall(callId)
@@ -162,10 +220,14 @@ export const useCallStore = create<CallState>((set, get) => ({
         userId: currentUser?.id || '',
         token: response.token,
         noiseSuppression: get().noiseSuppression,
+        maxReconnectAttempts: 5,
         onUserJoin: (user) => {
-          set((state) => ({
-            voiceUsers: [...state.voiceUsers, { id: user.userId, speaking: false }],
-          }))
+          // Don't add self or duplicates
+          if (user.userId === currentUser?.id) return
+          set((state) => {
+            if (state.voiceUsers.some((u) => u.id === user.userId)) return state
+            return { voiceUsers: [...state.voiceUsers, { id: user.userId, speaking: false }] }
+          })
         },
         onUserLeave: (userId) => {
           set((state) => ({
@@ -184,14 +246,34 @@ export const useCallStore = create<CallState>((set, get) => ({
         },
         onConnected: () => {
           console.log('Voice connected')
+          // Clear reconnecting state on successful connect/reconnect
+          set({ isReconnecting: false, reconnectAttempt: 0 })
+        },
+        onReconnecting: (attempt, maxAttempts) => {
+          console.log(`Voice reconnecting: attempt ${attempt}/${maxAttempts}`)
+          set({ isReconnecting: true, reconnectAttempt: attempt })
+        },
+        onStateChange: (state) => {
+          console.log('Voice state changed:', state)
+          if (state === ConnectionState.DISCONNECTED) {
+            set({ isReconnecting: false, reconnectAttempt: 0 })
+          }
         },
         onDisconnected: () => {
-          console.log('Voice disconnected')
-          // Clean up state directly (don't call leaveCall to avoid recursion)
+          // This is only called when VoiceClient gives up after all reconnect attempts
+          console.log('Voice disconnected (final)')
           const { myCall: currentCall } = get()
           if (currentCall) {
             callsApi.leaveCall(currentCall.id).catch(() => {})
-            set({ myCall: null, voiceClient: null, isMuted: false, voiceUsers: [] })
+            set({
+              myCall: null,
+              voiceClient: null,
+              isMuted: false,
+              isJoining: false,
+              isReconnecting: false,
+              reconnectAttempt: 0,
+              voiceUsers: [],
+            })
           }
         },
       })
@@ -199,10 +281,10 @@ export const useCallStore = create<CallState>((set, get) => ({
       await voiceClient.connect()
       await voiceClient.startSpeaking()
 
-      set({ voiceClient })
+      set({ voiceClient, isJoining: false })
     } catch (err) {
       console.error('Failed to join call:', err)
-      set({ myCall: null })
+      set({ myCall: null, isJoining: false })
     }
   },
 
@@ -221,7 +303,15 @@ export const useCallStore = create<CallState>((set, get) => ({
       }
     }
 
-    set({ myCall: null, voiceClient: null, isMuted: false, voiceUsers: [] })
+    set({
+      myCall: null,
+      voiceClient: null,
+      isMuted: false,
+      isJoining: false,
+      isReconnecting: false,
+      reconnectAttempt: 0,
+      voiceUsers: [],
+    })
   },
 
   toggleMute: () => {
@@ -251,6 +341,9 @@ export const useCallStore = create<CallState>((set, get) => ({
       calls: {},
       voiceClient: null,
       isMuted: false,
+      isJoining: false,
+      isReconnecting: false,
+      reconnectAttempt: 0,
       voiceUsers: [],
     })
   },
@@ -280,6 +373,9 @@ export const useCallStore = create<CallState>((set, get) => ({
             myCall: null,
             voiceClient: null,
             isMuted: false,
+            isJoining: false,
+            isReconnecting: false,
+            reconnectAttempt: 0,
             voiceUsers: [],
           }
         }
@@ -293,8 +389,10 @@ export const useCallStore = create<CallState>((set, get) => ({
   initFromReady: async (activeCalls) => {
     const calls: Record<string, CallInfo> = {}
     const currentUserId = useAuthStore.getState().user?.id
+    const { myCall, voiceClient } = get()
 
-    // Find if current user is stuck in any call
+    // Find if current user is in any call on server
+    let serverCallId: string | null = null
     let stuckCallId: string | null = null
 
     for (const call of activeCalls) {
@@ -304,22 +402,60 @@ export const useCallStore = create<CallState>((set, get) => ({
           participants: call.participants,
         }
 
-        // Check if current user is in this call but we don't have local state
         if (currentUserId && call.participants.includes(currentUserId)) {
-          const { myCall } = get()
-          if (!myCall) {
-            // User is in a call on server but not locally - this is a stuck call
-            stuckCallId = call.call_id
-          }
+          serverCallId = call.call_id
         }
       }
     }
 
-    set({ calls })
+    // Case 1: Local call exists but NOT on server - orphaned local state, clean up
+    if (myCall && !serverCallId) {
+      console.log('Local call exists but not on server, cleaning up:', myCall.id)
+      if (voiceClient) {
+        voiceClient.disconnect()
+      }
+      set({
+        calls,
+        myCall: null,
+        voiceClient: null,
+        isMuted: false,
+        isJoining: false,
+        isReconnecting: false,
+        reconnectAttempt: 0,
+        voiceUsers: [],
+      })
+      return
+    }
 
-    // If user is stuck in a call, leave it automatically
+    // Case 2: Server has user in call but no local state - stuck on server, leave it
+    if (serverCallId && !myCall) {
+      stuckCallId = serverCallId
+    }
+
+    // Case 3: Both exist but mismatch - trust server, clean local
+    if (myCall && serverCallId && myCall.id !== serverCallId) {
+      console.log('Call ID mismatch, cleaning up local:', myCall.id, 'server:', serverCallId)
+      if (voiceClient) {
+        voiceClient.disconnect()
+      }
+      set({
+        calls,
+        myCall: null,
+        voiceClient: null,
+        isMuted: false,
+        isJoining: false,
+        isReconnecting: false,
+        reconnectAttempt: 0,
+        voiceUsers: [],
+      })
+      stuckCallId = serverCallId
+    } else {
+      set({ calls })
+    }
+
+    // Leave stuck call on server
     if (stuckCallId) {
-      console.log('Found stuck call, leaving automatically:', stuckCallId)
+      console.log('Found stuck call on server, leaving:', stuckCallId)
       try {
         await callsApi.leaveCall(stuckCallId)
       } catch (err) {
@@ -361,9 +497,10 @@ if (typeof window !== 'undefined') {
   // Check connection when page becomes visible again
   document.addEventListener('visibilitychange', () => {
     if (document.visibilityState === 'visible') {
-      const { myCall, voiceClient } = useCallStore.getState()
+      const { myCall, voiceClient, isReconnecting } = useCallStore.getState()
       // If we think we're in a call but voice client is null/disconnected, clean up
-      if (myCall && !voiceClient) {
+      // But don't clean up if we're in the middle of reconnecting
+      if (myCall && !voiceClient && !isReconnecting) {
         console.log('Voice client disconnected while page was hidden, cleaning up')
         useCallStore.getState().leaveCall()
       }

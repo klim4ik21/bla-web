@@ -6,6 +6,11 @@
  *
  * Browser limitation: Uses WebSocket for media transport
  * (browsers cannot do raw UDP)
+ *
+ * Features:
+ * - Automatic reconnection with exponential backoff
+ * - Session persistence across reconnects
+ * - State machine for connection states
  */
 
 import nacl from 'tweetnacl'
@@ -13,7 +18,15 @@ import { AudioPipeline } from './AudioPipeline'
 import { OPUS_FRAME_SIZE } from './OpusCodec'
 import { JitterBuffer } from './JitterBuffer'
 
-// Opcodes
+// Connection states
+export enum ConnectionState {
+  DISCONNECTED = 'disconnected',
+  CONNECTING = 'connecting',
+  CONNECTED = 'connected',
+  RECONNECTING = 'reconnecting',
+}
+
+// Opcodes (must match SFU server)
 const Op = {
   // Client -> Server
   IDENTIFY: 0,
@@ -55,12 +68,15 @@ interface VoiceClientOptions {
   userId: string
   token: string
   noiseSuppression?: boolean // Enable RNNoise (default: true)
+  maxReconnectAttempts?: number // Max reconnect attempts (default: 5)
   onUserJoin?: (user: VoiceUser) => void
   onUserLeave?: (userId: string) => void
   onUserSpeaking?: (userId: string, speaking: boolean) => void
   onError?: (error: Error) => void
   onConnected?: () => void
   onDisconnected?: () => void
+  onReconnecting?: (attempt: number, maxAttempts: number) => void
+  onStateChange?: (state: ConnectionState) => void
 }
 
 interface ReadyData {
@@ -88,11 +104,20 @@ export class VoiceClient {
   // Connection state
   private ssrc: number = 0
   private secretKey: Uint8Array | null = null
+  private sessionId: string // Persists across reconnects
+  private connectionState: ConnectionState = ConnectionState.DISCONNECTED
+
+  // Reconnect settings
+  private readonly maxReconnectAttempts: number
+  private reconnectAttempt: number = 0
+  private reconnectTimer: ReturnType<typeof setTimeout> | null = null
+  private intentionalDisconnect: boolean = false
 
   // Heartbeat
   private heartbeatInterval: number = 0
   private heartbeatTimer: ReturnType<typeof setInterval> | null = null
   private lastHeartbeatAck: number = 0
+  private missedHeartbeats: number = 0
 
   // Users in room
   private users: Map<string, VoiceUser> = new Map()
@@ -109,20 +134,38 @@ export class VoiceClient {
   private playbackTimer: ReturnType<typeof setInterval> | null = null
 
   // State
-  private _connected: boolean = false
   private speaking: boolean = false
   private noiseSuppressionEnabled: boolean = true
+
+  // Track if we were speaking before disconnect (to resume)
+  private wasSpeaking: boolean = false
 
   constructor(options: VoiceClientOptions) {
     this.options = options
     this.noiseSuppressionEnabled = options.noiseSuppression !== false
+    this.maxReconnectAttempts = options.maxReconnectAttempts ?? 5
+    this.sessionId = crypto.randomUUID() // Generate once, reuse on reconnect
   }
 
   /**
    * Check if connected to voice server
    */
   get isConnected(): boolean {
-    return this._connected
+    return this.connectionState === ConnectionState.CONNECTED
+  }
+
+  /**
+   * Get current connection state
+   */
+  get state(): ConnectionState {
+    return this.connectionState
+  }
+
+  /**
+   * Check if currently reconnecting
+   */
+  get isReconnecting(): boolean {
+    return this.connectionState === ConnectionState.RECONNECTING
   }
 
   /**
@@ -147,12 +190,23 @@ export class VoiceClient {
    * Connect to voice server
    */
   async connect(): Promise<void> {
+    // Don't connect if already connecting/connected
+    if (this.connectionState === ConnectionState.CONNECTING ||
+        this.connectionState === ConnectionState.CONNECTED) {
+      console.warn('VoiceClient: Already connecting or connected')
+      return
+    }
+
+    this.intentionalDisconnect = false
+    this.setState(ConnectionState.CONNECTING)
+
     return new Promise((resolve, reject) => {
       try {
         this.ws = new WebSocket(this.options.wsUrl)
         this.ws.binaryType = 'arraybuffer'
 
         this.ws.onopen = () => {
+          console.log('VoiceClient: WebSocket opened, identifying...')
           this.identify()
         }
 
@@ -166,13 +220,18 @@ export class VoiceClient {
           }
         }
 
-        this.ws.onclose = () => {
+        this.ws.onclose = (event) => {
+          console.log('VoiceClient: WebSocket closed, code:', event.code, 'reason:', event.reason)
           this.handleDisconnect()
         }
 
-        this.ws.onerror = () => {
+        this.ws.onerror = (event) => {
+          console.error('VoiceClient: WebSocket error', event)
           this.options.onError?.(new Error('WebSocket error'))
-          reject(new Error('WebSocket error'))
+          if (this.connectionState === ConnectionState.CONNECTING) {
+            this.setState(ConnectionState.DISCONNECTED)
+            reject(new Error('WebSocket error'))
+          }
         }
 
         // Track if resolved
@@ -190,6 +249,7 @@ export class VoiceClient {
 
           if (msg.op === Op.SESSION_DESC && !resolved) {
             resolved = true
+            this.reconnectAttempt = 0 // Reset on successful connection
             resolve()
           }
         }
@@ -199,20 +259,31 @@ export class VoiceClient {
         // Timeout
         setTimeout(() => {
           if (!resolved) {
+            this.setState(ConnectionState.DISCONNECTED)
             reject(new Error('Connection timeout'))
           }
         }, 10000)
 
       } catch (error) {
+        this.setState(ConnectionState.DISCONNECTED)
         reject(error)
       }
     })
   }
 
   /**
-   * Disconnect from voice server
+   * Disconnect from voice server (intentional disconnect, no reconnect)
    */
   disconnect(): void {
+    console.log('VoiceClient: Intentional disconnect')
+    this.intentionalDisconnect = true
+
+    // Cancel any pending reconnect
+    if (this.reconnectTimer) {
+      clearTimeout(this.reconnectTimer)
+      this.reconnectTimer = null
+    }
+
     this.stopSpeaking()
 
     if (this.heartbeatTimer) {
@@ -251,7 +322,7 @@ export class VoiceClient {
     this.users.clear()
     this.ssrcToUser.clear()
     this.secretKey = null
-    this._connected = false
+    this.setState(ConnectionState.DISCONNECTED)
     this.options.onDisconnected?.()
   }
 
@@ -338,6 +409,17 @@ export class VoiceClient {
 
   // --- Private methods ---
 
+  /**
+   * Update connection state and notify listeners
+   */
+  private setState(newState: ConnectionState): void {
+    if (this.connectionState === newState) return
+    const oldState = this.connectionState
+    this.connectionState = newState
+    console.log(`VoiceClient state: ${oldState} -> ${newState}`)
+    this.options.onStateChange?.(newState)
+  }
+
   private send(op: number, data: unknown): void {
     if (this.ws?.readyState === WebSocket.OPEN) {
       this.ws.send(JSON.stringify({ op, d: data }))
@@ -345,12 +427,14 @@ export class VoiceClient {
   }
 
   private identify(): void {
+    // Use persistent sessionId for reconnect identification
     this.send(Op.IDENTIFY, {
       room_id: this.options.roomId,
       user_id: this.options.userId,
-      session_id: crypto.randomUUID(),
+      session_id: this.sessionId,
       token: this.options.token,
     })
+    console.log('VoiceClient: Sent IDENTIFY with session:', this.sessionId.slice(0, 8) + '...')
   }
 
   private handleMessage(msg: { op: number; d: unknown }): void {
@@ -365,6 +449,7 @@ export class VoiceClient {
 
       case Op.HEARTBEAT_ACK:
         this.lastHeartbeatAck = Date.now()
+        this.missedHeartbeats = 0
         break
 
       case Op.USER_JOIN:
@@ -411,14 +496,16 @@ export class VoiceClient {
       this.secretKey[i] = binaryString.charCodeAt(i)
     }
 
-    // Initialize playback context
-    this.playbackContext = new AudioContext({ sampleRate: 48000 })
+    // Initialize playback context if needed (might exist from before reconnect)
+    if (!this.playbackContext || this.playbackContext.state === 'closed') {
+      this.playbackContext = new AudioContext({ sampleRate: 48000 })
+    }
 
     // Start playback timer (20ms intervals for Opus frames)
     this.startPlaybackTimer()
 
-    this._connected = true
-    this.options.onConnected?.()
+    this.setState(ConnectionState.CONNECTED)
+    // Note: onConnected is called by reconnect() if this is a reconnection
 
     console.log('Voice connected with codec:', data.audio_codec, 'key length:', this.secretKey.length)
   }
@@ -461,22 +548,215 @@ export class VoiceClient {
     this.options.onUserSpeaking?.(data.user_id, data.speaking !== 0)
   }
 
+  /**
+   * Handle unexpected disconnect - attempt reconnect
+   */
   private handleDisconnect(): void {
     if (this.heartbeatTimer) {
       clearInterval(this.heartbeatTimer)
+      this.heartbeatTimer = null
     }
-    this._connected = false
-    this.options.onDisconnected?.()
+
+    // If intentional disconnect, don't try to reconnect
+    if (this.intentionalDisconnect) {
+      console.log('VoiceClient: Intentional disconnect, not reconnecting')
+      return
+    }
+
+    // If already reconnecting, don't start another attempt
+    if (this.connectionState === ConnectionState.RECONNECTING) {
+      return
+    }
+
+    // Save speaking state to resume after reconnect
+    this.wasSpeaking = this.speaking
+
+    // Stop sending audio during reconnect but keep stream alive
+    if (this.speaking) {
+      this.speaking = false
+    }
+
+    // Clear WebSocket reference
+    this.ws = null
+
+    // Check if we should reconnect
+    if (this.reconnectAttempt >= this.maxReconnectAttempts) {
+      console.log('VoiceClient: Max reconnect attempts reached, giving up')
+      this.setState(ConnectionState.DISCONNECTED)
+      this.cleanupResources()
+      this.options.onDisconnected?.()
+      return
+    }
+
+    // Start reconnection
+    this.setState(ConnectionState.RECONNECTING)
+    this.reconnect()
+  }
+
+  /**
+   * Attempt to reconnect with exponential backoff
+   */
+  private async reconnect(): Promise<void> {
+    this.reconnectAttempt++
+
+    // Exponential backoff: 1s, 2s, 4s, 8s, 16s (max)
+    const delay = Math.min(1000 * Math.pow(2, this.reconnectAttempt - 1), 16000)
+
+    console.log(`VoiceClient: Reconnect attempt ${this.reconnectAttempt}/${this.maxReconnectAttempts} in ${delay}ms`)
+    this.options.onReconnecting?.(this.reconnectAttempt, this.maxReconnectAttempts)
+
+    // Wait before reconnecting
+    await new Promise<void>((resolve) => {
+      this.reconnectTimer = setTimeout(resolve, delay)
+    })
+
+    // Check if disconnect was called during wait
+    if (this.intentionalDisconnect) {
+      console.log('VoiceClient: Reconnect cancelled (intentional disconnect)')
+      return
+    }
+
+    try {
+      // Create new WebSocket connection
+      this.ws = new WebSocket(this.options.wsUrl)
+      this.ws.binaryType = 'arraybuffer'
+
+      await new Promise<void>((resolve, reject) => {
+        if (!this.ws) {
+          reject(new Error('WebSocket is null'))
+          return
+        }
+
+        const timeout = setTimeout(() => {
+          reject(new Error('Reconnect timeout'))
+        }, 10000)
+
+        this.ws.onopen = () => {
+          console.log('VoiceClient: Reconnect WebSocket opened')
+          this.identify()
+        }
+
+        this.ws.onmessage = (event) => {
+          if (event.data instanceof ArrayBuffer) {
+            this.handleAudioPacket(new Uint8Array(event.data))
+            return
+          }
+
+          const msg = JSON.parse(event.data)
+          this.handleMessage(msg)
+
+          if (msg.op === Op.SESSION_DESC) {
+            clearTimeout(timeout)
+            resolve()
+          }
+        }
+
+        this.ws.onclose = () => {
+          clearTimeout(timeout)
+          reject(new Error('WebSocket closed during reconnect'))
+        }
+
+        this.ws.onerror = () => {
+          clearTimeout(timeout)
+          reject(new Error('WebSocket error during reconnect'))
+        }
+      })
+
+      // Successfully reconnected
+      console.log('VoiceClient: Reconnected successfully')
+      this.reconnectAttempt = 0
+      this.missedHeartbeats = 0
+
+      // Resume speaking if we were before
+      if (this.wasSpeaking) {
+        console.log('VoiceClient: Resuming speaking after reconnect')
+        this.speaking = true
+        this.sendSpeaking(SpeakingFlags.MICROPHONE)
+      }
+
+      this.options.onConnected?.()
+
+    } catch (error) {
+      console.error('VoiceClient: Reconnect failed:', error)
+
+      // Try again or give up
+      if (this.reconnectAttempt < this.maxReconnectAttempts && !this.intentionalDisconnect) {
+        this.reconnect()
+      } else {
+        console.log('VoiceClient: Giving up reconnection')
+        this.setState(ConnectionState.DISCONNECTED)
+        this.cleanupResources()
+        this.options.onDisconnected?.()
+      }
+    }
+  }
+
+  /**
+   * Clean up all resources (called on final disconnect)
+   */
+  private cleanupResources(): void {
+    if (this.localStream) {
+      this.localStream.getTracks().forEach(track => track.stop())
+      this.localStream = null
+    }
+
+    if (this.processorNode) {
+      this.processorNode.disconnect()
+      this.processorNode = null
+    }
+
+    if (this.audioPipeline) {
+      this.audioPipeline.destroy()
+      this.audioPipeline = null
+    }
+
+    if (this.audioContext) {
+      this.audioContext.close()
+      this.audioContext = null
+    }
+
+    if (this.playbackTimer) {
+      clearInterval(this.playbackTimer)
+      this.playbackTimer = null
+    }
+
+    if (this.playbackContext) {
+      this.playbackContext.close()
+      this.playbackContext = null
+    }
+
+    for (const jitterBuffer of this.jitterBuffers.values()) {
+      jitterBuffer.destroy()
+    }
+    this.jitterBuffers.clear()
+    this.nextPlayTime.clear()
+    this.users.clear()
+    this.ssrcToUser.clear()
+    this.secretKey = null
   }
 
   private startHeartbeat(): void {
+    this.lastHeartbeatAck = Date.now()
+    this.missedHeartbeats = 0
+
+    // Clear existing timer if any
+    if (this.heartbeatTimer) {
+      clearInterval(this.heartbeatTimer)
+    }
+
     this.heartbeatTimer = setInterval(() => {
       this.send(Op.HEARTBEAT, { nonce: Date.now() })
 
-      // Check for missed heartbeats
-      if (this.lastHeartbeatAck > 0 && Date.now() - this.lastHeartbeatAck > this.heartbeatInterval * 2) {
-        console.warn('Heartbeat timeout, reconnecting...')
-        this.ws?.close()
+      // Check for missed heartbeats (allow 2 missed before considering dead)
+      const timeSinceAck = Date.now() - this.lastHeartbeatAck
+      if (timeSinceAck > this.heartbeatInterval * 1.5) {
+        this.missedHeartbeats++
+        console.warn(`VoiceClient: Missed heartbeat #${this.missedHeartbeats}, last ack ${timeSinceAck}ms ago`)
+
+        if (this.missedHeartbeats >= 2) {
+          console.warn('VoiceClient: Heartbeat timeout, triggering reconnect...')
+          this.ws?.close() // This will trigger handleDisconnect -> reconnect
+        }
       }
     }, this.heartbeatInterval)
   }
