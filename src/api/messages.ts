@@ -31,12 +31,21 @@ export interface Message {
   id: string
   conversation_id: string
   sender_id: string
+  type?: 'text' | 'call' // default: 'text'
   content: string
   created_at: string
   updated_at: string
   sender?: User
   attachments?: Attachment[]
   reactions?: Reaction[]
+}
+
+// Call message content (parsed from Message.content JSON)
+export interface CallMessageContent {
+  call_id: string
+  duration: number // seconds
+  participants: string[] // user IDs who joined
+  status: 'completed' | 'missed' | 'cancelled'
 }
 
 export interface Conversation {
