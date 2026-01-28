@@ -1,31 +1,18 @@
 import { create } from 'zustand'
-import { Room, RoomEvent, Track, RemoteTrackPublication, RemoteParticipant, DisconnectReason } from 'livekit-client'
+import { VoiceClient } from '../lib/voice/VoiceClient'
 import { callsApi } from '../api/messages'
 import { useAuthStore } from './authStore'
-
-// Helper to attach remote audio tracks to DOM for playback
-function attachTrack(track: Track, participant: RemoteParticipant) {
-  if (track.kind === Track.Kind.Audio) {
-    const audioElement = track.attach()
-    audioElement.id = `audio-${participant.identity}`
-    document.body.appendChild(audioElement)
-  }
-}
-
-function detachTrack(track: Track, participant: RemoteParticipant) {
-  if (track.kind === Track.Kind.Audio) {
-    track.detach()
-    const audioElement = document.getElementById(`audio-${participant.identity}`)
-    if (audioElement) {
-      audioElement.remove()
-    }
-  }
-}
 
 // Call state for a conversation (from backend)
 export interface CallInfo {
   id: string
   participants: string[] // user IDs currently in the call
+}
+
+// Voice user in call
+interface VoiceUser {
+  id: string
+  speaking: boolean
 }
 
 type CallState = {
@@ -38,15 +25,22 @@ type CallState = {
   // All active calls by conversation ID (from backend - source of truth)
   calls: Record<string, CallInfo>
 
-  // LiveKit room and local state
-  room: Room | null
+  // Voice client and local state
+  voiceClient: VoiceClient | null
   isMuted: boolean
+
+  // Users in current call
+  voiceUsers: VoiceUser[]
+
+  // Noise suppression
+  noiseSuppression: boolean
 
   // Actions
   startCall: (conversationId: string) => Promise<void>
   joinCall: (callId: string, conversationId: string) => Promise<void>
   leaveCall: () => Promise<void>
   toggleMute: () => void
+  toggleNoiseSuppression: () => void
   reset: () => void
 
   // Event handler from WebSocket (single handler for all call state changes)
@@ -59,11 +53,14 @@ type CallState = {
 export const useCallStore = create<CallState>((set, get) => ({
   myCall: null,
   calls: {},
-  room: null,
+  voiceClient: null,
   isMuted: false,
+  voiceUsers: [],
+  noiseSuppression: true,
 
   startCall: async (conversationId: string) => {
     const { myCall } = get()
+    const currentUser = useAuthStore.getState().user
 
     // Already in a call?
     if (myCall && myCall.conversationId !== conversationId) {
@@ -81,31 +78,56 @@ export const useCallStore = create<CallState>((set, get) => ({
           conversationId,
         },
         isMuted: false,
+        voiceUsers: [],
       })
 
-      // Connect to LiveKit
-      const room = new Room()
-
-      room.on(RoomEvent.TrackSubscribed, (track: Track, _publication: RemoteTrackPublication, participant: RemoteParticipant) => {
-        attachTrack(track, participant)
+      // Connect to custom voice server
+      const voiceClient = new VoiceClient({
+        wsUrl: response.livekit_url, // This is now our SFU URL
+        roomId: `call-${response.call_id}`,
+        userId: currentUser?.id || '',
+        token: response.token,
+        noiseSuppression: get().noiseSuppression,
+        onUserJoin: (user) => {
+          set((state) => ({
+            voiceUsers: [...state.voiceUsers, { id: user.userId, speaking: false }],
+          }))
+        },
+        onUserLeave: (userId) => {
+          set((state) => ({
+            voiceUsers: state.voiceUsers.filter((u) => u.id !== userId),
+          }))
+        },
+        onUserSpeaking: (userId, speaking) => {
+          set((state) => ({
+            voiceUsers: state.voiceUsers.map((u) =>
+              u.id === userId ? { ...u, speaking } : u
+            ),
+          }))
+        },
+        onError: (error) => {
+          console.error('Voice error:', error)
+        },
+        onConnected: () => {
+          console.log('Voice connected')
+        },
+        onDisconnected: () => {
+          console.log('Voice disconnected')
+          // Clean up state directly (don't call leaveCall to avoid recursion)
+          const { myCall: currentCall } = get()
+          if (currentCall) {
+            // Notify backend
+            callsApi.leaveCall(currentCall.id).catch(() => {})
+            // Clear local state
+            set({ myCall: null, voiceClient: null, isMuted: false, voiceUsers: [] })
+          }
+        },
       })
 
-      room.on(RoomEvent.TrackUnsubscribed, (track: Track, _publication: RemoteTrackPublication, participant: RemoteParticipant) => {
-        detachTrack(track, participant)
-      })
+      await voiceClient.connect()
+      await voiceClient.startSpeaking()
 
-      room.on(RoomEvent.Disconnected, (reason?: DisconnectReason) => {
-        console.log('Disconnected from LiveKit room, reason:', reason)
-        // If disconnected unexpectedly, clean up state
-        if (reason !== DisconnectReason.CLIENT_INITIATED) {
-          get().leaveCall()
-        }
-      })
-
-      await room.connect(response.livekit_url, response.token)
-      await room.localParticipant.setMicrophoneEnabled(true)
-
-      set({ room })
+      set({ voiceClient })
     } catch (err) {
       console.error('Failed to start call:', err)
       set({ myCall: null })
@@ -114,6 +136,7 @@ export const useCallStore = create<CallState>((set, get) => ({
 
   joinCall: async (callId: string, conversationId: string) => {
     const { myCall } = get()
+    const currentUser = useAuthStore.getState().user
 
     if (myCall) {
       console.error('Already in a call')
@@ -129,31 +152,54 @@ export const useCallStore = create<CallState>((set, get) => ({
           conversationId,
         },
         isMuted: false,
+        voiceUsers: [],
       })
 
-      // Connect to LiveKit
-      const room = new Room()
-
-      room.on(RoomEvent.TrackSubscribed, (track: Track, _publication: RemoteTrackPublication, participant: RemoteParticipant) => {
-        attachTrack(track, participant)
+      // Connect to custom voice server
+      const voiceClient = new VoiceClient({
+        wsUrl: response.livekit_url,
+        roomId: `call-${response.call_id}`,
+        userId: currentUser?.id || '',
+        token: response.token,
+        noiseSuppression: get().noiseSuppression,
+        onUserJoin: (user) => {
+          set((state) => ({
+            voiceUsers: [...state.voiceUsers, { id: user.userId, speaking: false }],
+          }))
+        },
+        onUserLeave: (userId) => {
+          set((state) => ({
+            voiceUsers: state.voiceUsers.filter((u) => u.id !== userId),
+          }))
+        },
+        onUserSpeaking: (userId, speaking) => {
+          set((state) => ({
+            voiceUsers: state.voiceUsers.map((u) =>
+              u.id === userId ? { ...u, speaking } : u
+            ),
+          }))
+        },
+        onError: (error) => {
+          console.error('Voice error:', error)
+        },
+        onConnected: () => {
+          console.log('Voice connected')
+        },
+        onDisconnected: () => {
+          console.log('Voice disconnected')
+          // Clean up state directly (don't call leaveCall to avoid recursion)
+          const { myCall: currentCall } = get()
+          if (currentCall) {
+            callsApi.leaveCall(currentCall.id).catch(() => {})
+            set({ myCall: null, voiceClient: null, isMuted: false, voiceUsers: [] })
+          }
+        },
       })
 
-      room.on(RoomEvent.TrackUnsubscribed, (track: Track, _publication: RemoteTrackPublication, participant: RemoteParticipant) => {
-        detachTrack(track, participant)
-      })
+      await voiceClient.connect()
+      await voiceClient.startSpeaking()
 
-      room.on(RoomEvent.Disconnected, (reason?: DisconnectReason) => {
-        console.log('Disconnected from LiveKit room, reason:', reason)
-        // If disconnected unexpectedly, clean up state
-        if (reason !== DisconnectReason.CLIENT_INITIATED) {
-          get().leaveCall()
-        }
-      })
-
-      await room.connect(response.livekit_url, response.token)
-      await room.localParticipant.setMicrophoneEnabled(true)
-
-      set({ room })
+      set({ voiceClient })
     } catch (err) {
       console.error('Failed to join call:', err)
       set({ myCall: null })
@@ -161,10 +207,10 @@ export const useCallStore = create<CallState>((set, get) => ({
   },
 
   leaveCall: async () => {
-    const { myCall, room } = get()
+    const { myCall, voiceClient } = get()
 
-    if (room) {
-      room.disconnect()
+    if (voiceClient) {
+      voiceClient.disconnect()
     }
 
     if (myCall) {
@@ -175,27 +221,37 @@ export const useCallStore = create<CallState>((set, get) => ({
       }
     }
 
-    set({ myCall: null, room: null, isMuted: false })
+    set({ myCall: null, voiceClient: null, isMuted: false, voiceUsers: [] })
   },
 
   toggleMute: () => {
-    const { room, isMuted } = get()
-    if (room) {
-      room.localParticipant.setMicrophoneEnabled(isMuted) // enable if currently muted
+    const { voiceClient, isMuted } = get()
+    if (voiceClient) {
+      voiceClient.setMuted(!isMuted)
     }
     set({ isMuted: !isMuted })
   },
 
+  toggleNoiseSuppression: () => {
+    const { voiceClient, noiseSuppression } = get()
+    const newValue = !noiseSuppression
+    if (voiceClient) {
+      voiceClient.setNoiseSuppression(newValue)
+    }
+    set({ noiseSuppression: newValue })
+  },
+
   reset: () => {
-    const { room } = get()
-    if (room) {
-      room.disconnect()
+    const { voiceClient } = get()
+    if (voiceClient) {
+      voiceClient.disconnect()
     }
     set({
       myCall: null,
       calls: {},
-      room: null,
+      voiceClient: null,
       isMuted: false,
+      voiceUsers: [],
     })
   },
 
@@ -216,14 +272,15 @@ export const useCallStore = create<CallState>((set, get) => ({
 
         // If user was in this call, clear myCall
         if (state.myCall?.conversationId === conversationId) {
-          if (state.room) {
-            state.room.disconnect()
+          if (state.voiceClient) {
+            state.voiceClient.disconnect()
           }
           return {
             calls: newCalls,
             myCall: null,
-            room: null,
+            voiceClient: null,
             isMuted: false,
+            voiceUsers: [],
           }
         }
       }
@@ -276,12 +333,17 @@ export const useCallStore = create<CallState>((set, get) => ({
 if (typeof window !== 'undefined') {
   // Leave call when page closes
   window.addEventListener('beforeunload', () => {
-    const { myCall } = useCallStore.getState()
+    const { myCall, voiceClient } = useCallStore.getState()
     if (myCall) {
+      // Disconnect voice client immediately
+      if (voiceClient) {
+        voiceClient.disconnect()
+      }
+
       // Use fetch with keepalive for reliable delivery during page unload
       const token = localStorage.getItem('auth_token')
       if (token) {
-        fetch(`${import.meta.env.VITE_API_URL || 'http://localhost:8000'}/calls/leave`, {
+        fetch(`${import.meta.env.VITE_API_URL || 'http://localhost:8000'}/api/calls/leave`, {
           method: 'POST',
           headers: {
             'Content-Type': 'application/json',
@@ -299,10 +361,10 @@ if (typeof window !== 'undefined') {
   // Check connection when page becomes visible again
   document.addEventListener('visibilitychange', () => {
     if (document.visibilityState === 'visible') {
-      const { myCall, room } = useCallStore.getState()
-      // If we think we're in a call but room is disconnected, clean up
-      if (myCall && room && room.state === 'disconnected') {
-        console.log('Room disconnected while page was hidden, cleaning up')
+      const { myCall, voiceClient } = useCallStore.getState()
+      // If we think we're in a call but voice client is null/disconnected, clean up
+      if (myCall && !voiceClient) {
+        console.log('Voice client disconnected while page was hidden, cleaning up')
         useCallStore.getState().leaveCall()
       }
     }

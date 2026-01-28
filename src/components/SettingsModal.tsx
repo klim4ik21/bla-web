@@ -20,7 +20,7 @@ type AudioDevice = {
 export function SettingsModal({ isOpen, onClose }: Props) {
   const { user, uploadAvatar, isLoading, logout } = useAuthStore()
   const { isConnected, isReady } = useGatewayStore()
-  const { room, myCall } = useCallStore()
+  const { voiceClient, myCall } = useCallStore()
 
   const [activeSection, setActiveSection] = useState<SettingsSection>('profile')
   const [dragOver, setDragOver] = useState(false)
@@ -610,11 +610,11 @@ export function SettingsModal({ isOpen, onClose }: Props) {
                             {myCall && (
                               <div className="flex items-center justify-between">
                                 <div className="flex items-center gap-3">
-                                  <div className={`w-3 h-3 rounded-full ${room ? 'bg-emerald-400' : 'bg-amber-400'}`} />
+                                  <div className={`w-3 h-3 rounded-full ${voiceClient ? 'bg-emerald-400' : 'bg-amber-400'}`} />
                                   <span className="text-white/70">Голосовое соединение</span>
                                 </div>
-                                <span className={`text-sm ${room ? 'text-emerald-400' : 'text-amber-400'}`}>
-                                  {room ? 'Активно' : 'Подключение...'}
+                                <span className={`text-sm ${voiceClient ? 'text-emerald-400' : 'text-amber-400'}`}>
+                                  {voiceClient ? 'Активно' : 'Подключение...'}
                                 </span>
                               </div>
                             )}
@@ -670,8 +670,8 @@ export function SettingsModal({ isOpen, onClose }: Props) {
                               <span className="text-white/60">{myCall?.id || '—'}</span>
                             </div>
                             <div className="flex justify-between">
-                              <span className="text-white/40">Room State</span>
-                              <span className="text-white/60">{room?.state || '—'}</span>
+                              <span className="text-white/40">Voice State</span>
+                              <span className="text-white/60">{voiceClient ? 'Connected' : '—'}</span>
                             </div>
                           </div>
                         </div>

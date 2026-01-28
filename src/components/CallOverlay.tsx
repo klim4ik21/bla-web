@@ -16,7 +16,9 @@ export function CallOverlay({ conversationId, onExpand }: Props) {
     myCall,
     calls,
     isMuted,
+    noiseSuppression,
     toggleMute,
+    toggleNoiseSuppression,
     leaveCall,
     joinCall,
   } = useCallStore()
@@ -178,6 +180,29 @@ export function CallOverlay({ conversationId, onExpand }: Props) {
                     </>
                   ) : (
                     <path strokeLinecap="round" strokeLinejoin="round" d="M12 18.75a6 6 0 006-6v-1.5m-6 7.5a6 6 0 01-6-6v-1.5m6 7.5v3.75m-3.75 0h7.5M12 15.75a3 3 0 01-3-3V4.5a3 3 0 116 0v8.25a3 3 0 01-3 3z" />
+                  )}
+                </svg>
+              </motion.button>
+
+              <motion.button
+                onClick={toggleNoiseSuppression}
+                whileHover={{ scale: 1.05 }}
+                whileTap={{ scale: 0.95 }}
+                className={`w-10 h-10 rounded-xl flex items-center justify-center transition-all ${
+                  noiseSuppression
+                    ? 'bg-emerald-500/15 text-emerald-400'
+                    : 'text-white/40 hover:bg-white/[0.06] hover:text-white/70'
+                }`}
+                title={noiseSuppression ? 'Выключить шумоподавление' : 'Включить шумоподавление'}
+              >
+                <svg className="w-5 h-5" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={1.5}>
+                  {noiseSuppression ? (
+                    <path strokeLinecap="round" strokeLinejoin="round" d="M9.348 14.651a3.75 3.75 0 010-5.303m5.304 0a3.75 3.75 0 010 5.303m-7.425 2.122a6.75 6.75 0 010-9.546m9.546 0a6.75 6.75 0 010 9.546M5.106 18.894c-3.808-3.808-3.808-9.98 0-13.789m13.788 0c3.808 3.808 3.808 9.981 0 13.79M12 12h.008v.007H12V12zm.375 0a.375.375 0 11-.75 0 .375.375 0 01.75 0z" />
+                  ) : (
+                    <>
+                      <path strokeLinecap="round" strokeLinejoin="round" d="M18.364 5.636l-12.728 12.728" />
+                      <path strokeLinecap="round" strokeLinejoin="round" d="M9.348 14.651a3.75 3.75 0 010-5.303m5.304 0a3.75 3.75 0 010 5.303m-7.425 2.122a6.75 6.75 0 010-9.546m9.546 0a6.75 6.75 0 010 9.546" />
+                    </>
                   )}
                 </svg>
               </motion.button>

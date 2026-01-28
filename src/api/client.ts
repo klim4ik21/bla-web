@@ -1,4 +1,4 @@
-export const API_BASE_URL = 'https://api.joinbla.ru/api'
+export const API_BASE_URL = "http://localhost:8080/api"// 'https://api.joinbla.ru/api'
 const API_URL = API_BASE_URL
 
 type RequestOptions = {
