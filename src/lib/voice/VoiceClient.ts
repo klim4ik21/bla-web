@@ -101,8 +101,6 @@ export class VoiceClient {
   private timestamp: number = 0
   private processorNode: ScriptProcessorNode | null = null
   private rnnoise: RNNoiseProcessor | null = null
-  private denoisedBuffer: Float32Array = new Float32Array(0)
-
 
   // State
   private _connected: boolean = false
@@ -292,8 +290,6 @@ export class VoiceClient {
       this.rnnoise.destroy()
       this.rnnoise = null
     }
-
-    this.denoisedBuffer = new Float32Array(0)
 
     if (this.audioContext) {
       this.audioContext.close()
