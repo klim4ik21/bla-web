@@ -19,12 +19,14 @@ import { OPUS_FRAME_SIZE } from './OpusCodec'
 import { JitterBuffer } from './JitterBuffer'
 
 // Connection states
-export enum ConnectionState {
-  DISCONNECTED = 'disconnected',
-  CONNECTING = 'connecting',
-  CONNECTED = 'connected',
-  RECONNECTING = 'reconnecting',
-}
+export const ConnectionState = {
+  DISCONNECTED: 'disconnected',
+  CONNECTING: 'connecting',
+  CONNECTED: 'connected',
+  RECONNECTING: 'reconnecting',
+} as const
+
+export type ConnectionState = typeof ConnectionState[keyof typeof ConnectionState]
 
 // Opcodes (must match SFU server)
 const Op = {

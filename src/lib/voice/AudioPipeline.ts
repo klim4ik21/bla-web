@@ -11,16 +11,13 @@
  */
 
 import { RNNoiseProcessor } from './RNNoiseProcessor'
-import { OpusEncoder, OPUS_FRAME_SIZE } from './OpusCodec'
+import { OpusEncoder } from './OpusCodec'
 
 export class AudioPipeline {
   private rnnoise: RNNoiseProcessor | null = null
   private opusEncoder: OpusEncoder | null = null
   private noiseSuppressionEnabled: boolean
   private initialized = false
-
-  // Buffer for Int16 samples before Opus encoding
-  private int16Buffer: Int16Array = new Int16Array(0)
 
   private processCount = 0
 
@@ -155,7 +152,6 @@ export class AudioPipeline {
       this.opusEncoder.destroy()
       this.opusEncoder = null
     }
-    this.int16Buffer = new Int16Array(0)
     this.initialized = false
   }
 }

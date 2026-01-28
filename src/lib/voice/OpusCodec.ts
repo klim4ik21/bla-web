@@ -77,13 +77,6 @@ export class OpusEncoder {
       sampleRate: OPUS_SAMPLE_RATE,
       numberOfChannels: OPUS_CHANNELS,
       bitrate: OPUS_BITRATE,
-      opus: {
-        application: 'voip',
-        complexity: 5, // Balance between quality and CPU
-        signal: 'voice',
-        usedtx: true, // Don't transmit silence
-        useinbandfec: true, // Forward error correction
-      },
     })
 
     this.initialized = true
