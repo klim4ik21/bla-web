@@ -9,7 +9,9 @@
  */
 
 import nacl from 'tweetnacl'
-import { RNNoiseProcessor } from './RNNoiseProcessor'
+import { AudioPipeline } from './AudioPipeline'
+import { OPUS_FRAME_SIZE } from './OpusCodec'
+import { JitterBuffer } from './JitterBuffer'
 
 // Opcodes
 const Op = {
@@ -100,7 +102,11 @@ export class VoiceClient {
   private sequenceNumber: number = 0
   private timestamp: number = 0
   private processorNode: ScriptProcessorNode | null = null
-  private rnnoise: RNNoiseProcessor | null = null
+  private audioPipeline: AudioPipeline | null = null
+
+  // Jitter buffers for each remote user (by SSRC)
+  private jitterBuffers: Map<number, JitterBuffer> = new Map()
+  private playbackTimer: ReturnType<typeof setInterval> | null = null
 
   // State
   private _connected: boolean = false
@@ -123,7 +129,7 @@ export class VoiceClient {
    * Check if noise suppression is enabled
    */
   get isNoiseSuppressionEnabled(): boolean {
-    return this.noiseSuppressionEnabled && this.rnnoise !== null
+    return this.noiseSuppressionEnabled && this.audioPipeline?.isNoiseSuppressionActive === true
   }
 
   /**
@@ -131,6 +137,9 @@ export class VoiceClient {
    */
   setNoiseSuppression(enabled: boolean): void {
     this.noiseSuppressionEnabled = enabled
+    if (this.audioPipeline) {
+      this.audioPipeline.setNoiseSuppression(enabled)
+    }
     console.log('Noise suppression:', enabled ? 'enabled' : 'disabled')
   }
 
@@ -222,10 +231,21 @@ export class VoiceClient {
       this.localStream = null
     }
 
+    if (this.playbackTimer) {
+      clearInterval(this.playbackTimer)
+      this.playbackTimer = null
+    }
+
     if (this.playbackContext) {
       this.playbackContext.close()
       this.playbackContext = null
     }
+
+    // Clean up jitter buffers
+    for (const jitterBuffer of this.jitterBuffers.values()) {
+      jitterBuffer.destroy()
+    }
+    this.jitterBuffers.clear()
 
     this.nextPlayTime.clear()
     this.users.clear()
@@ -286,9 +306,9 @@ export class VoiceClient {
       this.processorNode = null
     }
 
-    if (this.rnnoise) {
-      this.rnnoise.destroy()
-      this.rnnoise = null
+    if (this.audioPipeline) {
+      this.audioPipeline.destroy()
+      this.audioPipeline = null
     }
 
     if (this.audioContext) {
@@ -394,6 +414,9 @@ export class VoiceClient {
     // Initialize playback context
     this.playbackContext = new AudioContext({ sampleRate: 48000 })
 
+    // Start playback timer (20ms intervals for Opus frames)
+    this.startPlaybackTimer()
+
     this._connected = true
     this.options.onConnected?.()
 
@@ -416,6 +439,16 @@ export class VoiceClient {
     if (user) {
       this.ssrcToUser.delete(user.ssrc)
       this.users.delete(data.user_id)
+
+      // Clean up jitter buffer for this user
+      const jitterBuffer = this.jitterBuffers.get(user.ssrc)
+      if (jitterBuffer) {
+        jitterBuffer.destroy()
+        this.jitterBuffers.delete(user.ssrc)
+      }
+
+      // Clean up playback timing
+      this.nextPlayTime.delete(user.ssrc)
     }
     this.options.onUserLeave?.(data.user_id)
   }
@@ -459,19 +492,10 @@ export class VoiceClient {
   private async setupAudioPipeline(): Promise<void> {
     if (!this.localStream || !this.audioContext) return
 
-    // Initialize RNNoise for noise suppression (if enabled)
-    if (this.noiseSuppressionEnabled) {
-      try {
-        this.rnnoise = new RNNoiseProcessor()
-        await this.rnnoise.init()
-        console.log('RNNoise noise suppression enabled')
-      } catch (err) {
-        console.warn('RNNoise not available, continuing without noise suppression:', err)
-        this.rnnoise = null
-      }
-    } else {
-      console.log('Noise suppression disabled')
-    }
+    // Initialize AudioPipeline (RNNoise + Opus)
+    this.audioPipeline = new AudioPipeline(this.noiseSuppressionEnabled)
+    await this.audioPipeline.init()
+    console.log('Audio pipeline initialized')
 
     const source = this.audioContext.createMediaStreamSource(this.localStream)
 
@@ -480,60 +504,22 @@ export class VoiceClient {
     this.processorNode = this.audioContext.createScriptProcessor(1024, 1, 1)
 
     let packetCount = 0
-    let rnnoiseLogCount = 0
     this.processorNode.onaudioprocess = (event) => {
-      if (!this.speaking || !this.secretKey) return
+      if (!this.speaking || !this.secretKey || !this.audioPipeline) return
 
       const inputData = event.inputBuffer.getChannelData(0)
 
-      let audioData: Float32Array | Float32Array = inputData
+      // Process through AudioPipeline (RNNoise + Opus encoding)
+      const opusPackets = this.audioPipeline.process(inputData)
 
-      // Apply RNNoise denoising if available and enabled
-      if (this.rnnoise && this.noiseSuppressionEnabled) {
-        try {
-          // Measure input level
-          let inputMax = 0
-          for (let i = 0; i < inputData.length; i++) {
-            inputMax = Math.max(inputMax, Math.abs(inputData[i]))
-          }
+      // Send each Opus packet
+      for (const packet of opusPackets) {
+        this.sendAudioPacket(packet)
+        packetCount++
 
-          const denoised = this.rnnoise.process(new Float32Array(inputData))
-
-          // Measure output level
-          let outputMax = 0
-          for (let i = 0; i < denoised.length; i++) {
-            outputMax = Math.max(outputMax, Math.abs(denoised[i]))
-          }
-
-          rnnoiseLogCount++
-          if (rnnoiseLogCount <= 10 || rnnoiseLogCount % 100 === 0) {
-            console.log('RNNoise: in', inputData.length, 'out', denoised.length,
-              'inMax', inputMax.toFixed(4), 'outMax', outputMax.toFixed(4))
-          }
-
-          if (denoised.length > 0) {
-            audioData = denoised
-          } else {
-            // RNNoise is buffering, skip this frame
-            return
-          }
-        } catch (err) {
-          console.error('RNNoise processing error:', err)
-          // Fall back to original audio
-          audioData = inputData
+        if (packetCount % 100 === 0) {
+          console.log('Sent Opus packets:', packetCount, 'size:', packet.length, 'bytes')
         }
-      }
-
-      // Convert Float32 to Int16 and send
-      const pcmData = new Int16Array(audioData.length)
-      for (let i = 0; i < audioData.length; i++) {
-        pcmData[i] = Math.max(-32768, Math.min(32767, Math.floor(audioData[i] * 32767)))
-      }
-      this.sendAudioPacket(pcmData)
-      packetCount++
-
-      if (packetCount % 100 === 0) {
-        console.log('Sent audio packets:', packetCount, 'size:', pcmData.length)
       }
     }
 
@@ -542,14 +528,7 @@ export class VoiceClient {
     this.processorNode.connect(this.audioContext.destination)
   }
 
-  private sendAudioPacket(pcmData: Int16Array): void {
-    // This is a simplified version
-    // In production, you'd:
-    // 1. Encode PCM to Opus
-    // 2. Create RTP header
-    // 3. Encrypt with XSalsa20-Poly1305
-    // 4. Send via UDP (or WebSocket fallback)
-
+  private sendAudioPacket(opusData: Uint8Array): void {
     if (!this.secretKey) return
 
     // Create RTP header
@@ -558,29 +537,28 @@ export class VoiceClient {
 
     header[0] = 0x80 // Version 2
     header[1] = 0x78 // Payload type 120 (Opus)
-    view.setUint16(2, this.sequenceNumber++, false)
+    view.setUint16(2, this.sequenceNumber, false)
     view.setUint32(4, this.timestamp, false)
     view.setUint32(8, this.ssrc, false)
 
-    this.timestamp += 1024 // ~21ms at 48kHz
-
-    // For now, send through WebSocket as binary
-    // In production, this should go through UDP
-    const payload = new Uint8Array(pcmData.buffer)
+    // Wrap sequence number at 16-bit boundary
+    this.sequenceNumber = (this.sequenceNumber + 1) & 0xFFFF
+    // Opus frame is 960 samples (20ms at 48kHz), wrap at 32-bit
+    this.timestamp = (this.timestamp + OPUS_FRAME_SIZE) >>> 0
 
     // Create nonce from header (padded to 24 bytes)
     const nonce = new Uint8Array(24)
     nonce.set(header)
 
-    // Encrypt
-    const encrypted = nacl.secretbox(payload, nonce, this.secretKey)
+    // Encrypt Opus packet
+    const encrypted = nacl.secretbox(opusData, nonce, this.secretKey)
 
     // Combine: header + encrypted
     const packet = new Uint8Array(header.length + encrypted.length)
     packet.set(header)
     packet.set(encrypted, header.length)
 
-    // Send (via WebSocket for now)
+    // Send via WebSocket
     if (this.ws?.readyState === WebSocket.OPEN) {
       this.ws.send(packet)
     }
@@ -591,11 +569,13 @@ export class VoiceClient {
   /**
    * Handle incoming audio packet (binary WebSocket message)
    */
-  private handleAudioPacket(data: Uint8Array): void {
+  private async handleAudioPacket(data: Uint8Array): Promise<void> {
     if (data.length < 12) return // Minimum RTP header size
 
     // Parse RTP header
     const view = new DataView(data.buffer, data.byteOffset, data.byteLength)
+    const sequence = view.getUint16(2, false)
+    const timestamp = view.getUint32(4, false)
     const ssrc = view.getUint32(8, false)
 
     // Find user by SSRC
@@ -603,7 +583,7 @@ export class VoiceClient {
 
     this.receivedPackets++
     if (this.receivedPackets % 50 === 1) {
-      console.log('Received audio packet, SSRC:', ssrc, 'userId:', userId, 'size:', data.length, 'total:', this.receivedPackets)
+      console.log('Received Opus packet, SSRC:', ssrc, 'seq:', sequence, 'size:', data.length, 'total:', this.receivedPackets)
     }
 
     if (!userId || userId === this.options.userId) return // Ignore own packets
@@ -612,17 +592,50 @@ export class VoiceClient {
     const nonce = new Uint8Array(24)
     nonce.set(data.slice(0, 12))
 
-    // Decrypt payload
+    // Decrypt payload (Opus data)
     const encryptedPayload = data.slice(12)
-    const decrypted = this.decrypt(encryptedPayload, nonce)
+    const opusData = this.decrypt(encryptedPayload, nonce)
 
-    if (!decrypted) {
+    if (!opusData) {
       console.warn('Failed to decrypt audio packet from SSRC:', ssrc)
       return
     }
 
-    // Play the audio
-    this.playAudio(ssrc, decrypted)
+    // Get or create jitter buffer for this SSRC
+    let jitterBuffer = this.jitterBuffers.get(ssrc)
+    if (!jitterBuffer) {
+      jitterBuffer = new JitterBuffer()
+      await jitterBuffer.init()
+      this.jitterBuffers.set(ssrc, jitterBuffer)
+      console.log('Created JitterBuffer for SSRC:', ssrc)
+    }
+
+    // Add packet to jitter buffer
+    jitterBuffer.push(sequence, timestamp, opusData)
+  }
+
+  /**
+   * Start the playback timer that pulls from jitter buffers
+   */
+  private startPlaybackTimer(): void {
+    if (this.playbackTimer) return
+
+    // 20ms interval matches Opus frame duration
+    this.playbackTimer = setInterval(() => {
+      this.processPlayback()
+    }, 20)
+  }
+
+  /**
+   * Process all jitter buffers and play audio
+   */
+  private processPlayback(): void {
+    for (const [ssrc, jitterBuffer] of this.jitterBuffers) {
+      const pcmData = jitterBuffer.pop()
+      if (pcmData && pcmData.length > 0) {
+        this.playAudio(ssrc, pcmData)
+      }
+    }
   }
 
   private nextPlayTime: Map<number, number> = new Map()
@@ -630,9 +643,9 @@ export class VoiceClient {
   private playCount = 0
 
   /**
-   * Play decrypted audio data
+   * Play decoded audio data (Int16 PCM from Opus decoder)
    */
-  private playAudio(ssrc: number, pcmData: Uint8Array): void {
+  private playAudio(ssrc: number, pcmData: Int16Array): void {
     if (!this.playbackContext) return
 
     // Resume context if suspended (browser autoplay policy)
@@ -641,11 +654,10 @@ export class VoiceClient {
     }
 
     // Convert Int16 PCM to Float32
-    const int16 = new Int16Array(pcmData.buffer, pcmData.byteOffset, pcmData.byteLength / 2)
-    const float32 = new Float32Array(int16.length)
+    const float32 = new Float32Array(pcmData.length)
 
-    for (let i = 0; i < int16.length; i++) {
-      float32[i] = int16[i] / 32768
+    for (let i = 0; i < pcmData.length; i++) {
+      float32[i] = pcmData[i] / 32768
     }
 
     this.playCount++
